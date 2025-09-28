@@ -1912,8 +1912,9 @@ int Server::AddCertificate(const CertInfo& cert) {
     SSLContext ssl_ctx;
     ssl_ctx.filters = cert.sni_filters;
     ssl_ctx.ctx = std::make_shared<SocketSSLContext>();
-    SSL_CTX* raw_ctx = CreateServerSSLContext(cert.certificate, cert.private_key,
-                                              _options.ssl_options(), &ssl_ctx.filters);
+    SSL_CTX* raw_ctx = CreateServerSSLContext(
+        cert.certificate, cert.private_key,
+        _options.ssl_options(), &_raw_alpns, &ssl_ctx.filters);
     if (raw_ctx == NULL) {
         return -1;
     }
