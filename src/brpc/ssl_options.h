@@ -36,6 +36,8 @@ struct CertInfo {
     // Supported both file path and raw string based on prefix:
     std::string private_key;
 
+    std::string private_key_passwd;
+
     // Additional hostnames besides those inside the certificate. Wildcards
     // are supported but it can only appear once at the beginning (i.e. *.xxx.com).
     std::vector<std::string> sni_filters;
@@ -157,6 +159,18 @@ struct ServerSSLOptions {
     // Available protocols: http, h2, baidu_std etc.
     // Default: empty
     std::string alpns;
+
+    // Whether to enable automatic certificate reload.
+    // If true, brpc will watch the certificate and private key files,
+    // and reload them dynamically when they are modified on disk.
+    // This allows certificate rotation without restarting the server.
+    // Default: false (certificate reload is disabled).
+    bool enable_certificate_reload;
+
+    // Interval in seconds for checking certificate changes when reload is enabled.
+    // Values <= 0 will set default value if enable_certificate_reload = true
+    // Default: 3600 (1h)
+    int certificate_reload_interval_s;
 
     // TODO: Support OSCP stapling
 };

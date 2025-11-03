@@ -89,6 +89,96 @@ static int ParseSSLProtocols(const std::string& str_protocol) {
     return protocol_flag;
 }
 
+bool IsPemFormattedKey(const std::string& input) {
+    static const char kPemPrefix[] = "-----BEGIN";
+    for (const char* s = input.c_str(); *s != '\0'; ++s) {
+        if (*s == '\n' || *s == '\r') {
+            continue;
+        }
+        return strncmp(s, kPemPrefix, sizeof(kPemPrefix) - 1) == 0;
+    }
+    return false;
+}
+
+int PasswordCallback(char *buf, int size, int rwflag, void *userdata) {
+    const char *pass = static_cast<const char*>(userdata);
+    int len = strlen(pass);
+    if (len > size) len = size;
+    memcpy(buf, pass, len);
+    return len;
+}
+
+bool ParsePrivateKeyWithPassword(const std::string& source,
+                                        const std::string& password,
+                                        std::string* parsed_key) {
+    if (parsed_key == NULL) {
+        LOG(ERROR) << "Output parameter for parsed key is null";
+        return false;
+    }
+    parsed_key->clear();
+    if (source.empty()) {
+        LOG(ERROR) << "Private key is empty";
+        return false;
+    }
+
+    using BIOPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
+    BIOPtr key_bio(NULL, BIO_free);
+
+    if (IsPemFormattedKey(source)) {
+        key_bio.reset(BIO_new_mem_buf(const_cast<char*>(source.c_str()), -1));
+    } else {
+        key_bio.reset(BIO_new(BIO_s_file()));
+        if (!key_bio) {
+            LOG(ERROR) << "Fail to create BIO for private key";
+            return false;
+        }
+        if (BIO_read_filename(key_bio.get(), source.c_str()) <= 0) {
+            LOG(ERROR) << "Fail to read private key from " << source
+                       << ": " << SSLError(ERR_get_error());
+            ERR_clear_error();
+            return false;
+        }
+    }
+
+    if (!key_bio) {
+        LOG(ERROR) << "Fail to initialize BIO for private key";
+        return false;
+    }
+
+    void* passwd_ptr = static_cast<void*>(const_cast<char*>(password.c_str()));
+    using EVPKeyPtr = std::unique_ptr<EVP_PKEY, decltype(&EVP_PKEY_free)>;
+    EVP_PKEY* raw_key = PEM_read_bio_PrivateKey(key_bio.get(), NULL, PasswordCallback, passwd_ptr);
+    EVPKeyPtr key(raw_key, EVP_PKEY_free);
+    if (!key) {
+        LOG(ERROR) << "Fail to parse private key: " << SSLError(ERR_get_error());
+        ERR_clear_error();
+        return false;
+    }
+
+    using BIOBufferPtr = std::unique_ptr<BIO, decltype(&BIO_free)>;
+    BIOBufferPtr buffer(BIO_new(BIO_s_mem()), BIO_free);
+    if (!buffer) {
+        LOG(ERROR) << "Fail to allocate memory BIO for private key";
+        return false;
+    }
+
+    if (PEM_write_bio_PrivateKey(buffer.get(), key.get(), NULL, NULL, 0, NULL, NULL) != 1) {
+        LOG(ERROR) << "Fail to export private key: " << SSLError(ERR_get_error());
+        ERR_clear_error();
+        return false;
+    }
+
+    char* data = NULL;
+    long len = BIO_get_mem_data(buffer.get(), &data);
+    if (len <= 0 || data == NULL) {
+        LOG(ERROR) << "Fail to retrieve private key buffer";
+        return false;
+    }
+
+    parsed_key->assign(data, static_cast<size_t>(len));
+    return true;
+}
+
 std::ostream& operator<<(std::ostream& os, const SSLError& ssl) {
     char buf[128];  // Should be enough
     ERR_error_string_n(ssl.error, buf, sizeof(buf));
@@ -484,10 +574,22 @@ SSL_CTX* CreateClientSSLContext(const ChannelSSLOptions& options) {
         return NULL;
     }
 
+    std::string parsed_private_key;
+    const std::string* private_key_in_use = &options.client_cert.private_key;
+    if (!options.client_cert.private_key_passwd.empty()) {
+        if (!ParsePrivateKeyWithPassword(options.client_cert.private_key,
+            options.client_cert.private_key_passwd,
+                                         &parsed_private_key)) {
+            LOG(ERROR) << "Failed to parse private key with password";
+            return NULL;
+        }
+        private_key_in_use = &parsed_private_key;
+    }
+
     if (!options.client_cert.certificate.empty()
         && LoadCertificate(ssl_ctx.get(),
                            options.client_cert.certificate,
-                           options.client_cert.private_key, NULL) != 0) {
+                           *private_key_in_use, NULL) != 0) {
         return NULL;
     }
 
