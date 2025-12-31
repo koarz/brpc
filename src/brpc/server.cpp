@@ -18,6 +18,8 @@
 
 #include <wordexp.h>                                // wordexp
 #include <iomanip>
+#include <cstring>
+#include <memory>
 #include <arpa/inet.h>                              // inet_aton
 #include <fcntl.h>                                  // O_CREAT
 #include <sys/stat.h>                               // mkdir
@@ -38,6 +40,13 @@
 #include "brpc/socket_map.h"                   // SocketMapList
 #include "brpc/acceptor.h"                     // Acceptor
 #include "brpc/details/ssl_helper.h"           // CreateServerSSLContext
+#ifndef USE_MESALINK
+#include <openssl/pem.h>
+#include <openssl/err.h>
+#else
+#include <mesalink/openssl/pem.h>
+#include <mesalink/openssl/err.h>
+#endif
 #include "brpc/protocol.h"                     // ListProtocols
 #include "brpc/nshead_service.h"               // NsheadService
 #ifdef ENABLE_THRIFT_FRAMED_PROTOCOL
@@ -401,7 +410,10 @@ Server::Server(ProfilerLinker)
     , _derivative_thread(INVALID_BTHREAD)
     , _keytable_pool(NULL)
     , _eps_bvar(&_nerror_bvar)
-    , _concurrency(0) {
+    , _concurrency(0)
+    , _ssl_reload_cert_thread(INVALID_BTHREAD)
+    , _ssl_reload_cert_thread_started(false)
+    , _ssl_reload_cert_thread_should_stop(false) {
     BAIDU_CASSERT(offsetof(Server, _concurrency) % 64 == 0,
                   Server_concurrency_must_be_aligned_by_cacheline);
 }
@@ -735,6 +747,12 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
                           const PortRange& port_range,
                           const ServerOptions *opt) {
     std::unique_ptr<Server, RevertServerStatus> revert_server(this);
+
+    {
+        BAIDU_SCOPED_LOCK(_ssl_reload_cert_mutex);
+        _ssl_reload_cert_thread_should_stop = false;
+    }
+
     if (_failed_to_set_max_concurrency_of_method) {
         _failed_to_set_max_concurrency_of_method = false;
         LOG(ERROR) << "previous call to MaxConcurrencyOf() was failed, "
@@ -1089,6 +1107,16 @@ int Server::StartInternal(const butil::EndPoint& endpoint,
         return -1;
     }
 
+    if (_options.has_ssl_options() &&
+        _options.ssl_options().enable_certificate_reload) {
+        if (_options.ssl_options().certificate_reload_interval_s <= 0) {
+            LOG(WARNING) << "SSL certificate reload is enabled but certificate_reload_interval_s<=0, skip watcher";
+        } else if (!StartSSLCertificateReloadThread()) {
+            LOG(ERROR) << "Fail to start SSL certificate reload thread";
+            return -1;
+        }
+    }
+
     // Print tips to server launcher.
     if (butil::is_endpoint_extended(_listen_addr)) {
         const char* builtin_msg = _options.has_builtin_services ? " with builtin service" : "";
@@ -1220,6 +1248,17 @@ int Server::Join() {
         bthread_stop(_derivative_thread);
         bthread_join(_derivative_thread, NULL);
         _derivative_thread = INVALID_BTHREAD;
+    }
+
+    if (_ssl_reload_cert_thread_started) {
+        {
+            BAIDU_SCOPED_LOCK(_ssl_reload_cert_mutex);
+            _ssl_reload_cert_thread_should_stop = true;
+        }
+        bthread_stop(_ssl_reload_cert_thread);
+        bthread_join(_ssl_reload_cert_thread, NULL);
+        _ssl_reload_cert_thread_started = false;
+        _ssl_reload_cert_thread = INVALID_BTHREAD;
     }
 
     g_running_server_count.fetch_sub(1, butil::memory_order_relaxed);
@@ -1897,6 +1936,99 @@ Server::FindServicePropertyByName(const butil::StringPiece& name) const {
     return _service_map.seek(name);
 }
 
+static void* DelayedFreeSSLContext(void* arg) {
+    SSL_CTX* ctx = static_cast<SSL_CTX*>(arg);
+    if (ctx == NULL) {
+        return NULL;
+    }
+
+    const int64_t cleanup_delay_us = 300000000;  // 300s grace period
+    bthread_usleep(cleanup_delay_us);
+    SSL_CTX_free(ctx);
+    LOG(INFO) << "Released previous SSL_CTX after certificate reload";
+    return NULL;
+}
+
+void Server::ReloadCertificate() {
+    // check open SSL
+    if (_default_ssl_ctx == NULL) {
+        LOG(WARNING) << "Server not start with ssl";
+        return;
+    }
+
+    // get default cert
+    const CertInfo& default_cert = _options.ssl_options().default_cert;
+    if (default_cert.certificate.empty()) {
+        LOG(ERROR) << "Default certificate is empty";
+        return;
+    }
+
+    // create a temp SSL context for verify new cert
+    std::string parsed_private_key;
+    const std::string* private_key_in_use = &default_cert.private_key;
+    if (!default_cert.private_key_passwd.empty()) {
+        if (!ParsePrivateKeyWithPassword(default_cert.private_key,
+                                         default_cert.private_key_passwd,
+                                         &parsed_private_key)) {
+            LOG(ERROR) << "Failed to parse private key with password";
+            return;
+        }
+        private_key_in_use = &parsed_private_key;
+    }
+
+    std::vector<std::string> temp_filters = default_cert.sni_filters;
+    SSL_CTX* new_raw_ctx = CreateServerSSLContext(
+        default_cert.certificate, *private_key_in_use,
+        _options.ssl_options(), &_raw_alpns, &temp_filters);
+
+    if (new_raw_ctx == NULL) {
+        LOG(ERROR) << "Failed to create new SSL context";
+        return;
+    }
+
+    // get origin SSL_CTX for release defer
+    SSL_CTX* origin_ctx = _default_ssl_ctx->raw_ctx;
+
+    {
+        // replace default_ssl_ctx's raw_ctx
+        BAIDU_SCOPED_LOCK(_default_ssl_ctx_mutex);
+        _default_ssl_ctx->raw_ctx = new_raw_ctx;
+    }
+    
+    // set SNI call back
+#ifdef SSL_CTRL_SET_TLSEXT_HOSTNAME
+    SSL_CTX_set_tlsext_servername_callback(new_raw_ctx, SSLSwitchCTXByHostname);
+    SSL_CTX_set_tlsext_servername_arg(new_raw_ctx, this);
+#endif
+    
+    // update SSL context mapping
+    std::string cert_key(default_cert.certificate);
+    cert_key.append(default_cert.private_key);
+    SSLContext* ssl_ctx = _ssl_ctx_map.seek(cert_key);
+    if (ssl_ctx != NULL) {
+        std::atomic_store_explicit(
+            reinterpret_cast<std::atomic<SSL_CTX*>*>(&ssl_ctx->ctx->raw_ctx),
+            new_raw_ctx,
+            std::memory_order_release
+        );
+    }
+    
+    // defer release the old SSL_CTX to avoid connection suffer trouble
+    if (origin_ctx != NULL) {
+        bthread_t cleanup_thread = INVALID_BTHREAD;
+        bthread_attr_t cleanup_attr = BTHREAD_ATTR_NORMAL;
+        if (bthread_start_background(&cleanup_thread, &cleanup_attr,
+                                     DelayedFreeSSLContext,
+                                     reinterpret_cast<void*>(origin_ctx)) != 0) {
+            LOG(ERROR) << "Failed to start cleanup bthread for previous SSL_CTX, "
+                       "releasing immediately";
+            SSL_CTX_free(origin_ctx);
+        }
+    }
+    
+    LOG(INFO) << "Successfully reloaded default SSL certificate";
+}
+
 int Server::AddCertificate(const CertInfo& cert) {
     if (!_options.has_ssl_options()) {
         LOG(ERROR) << "ServerOptions.ssl_options is not configured yet";
@@ -1909,11 +2041,23 @@ int Server::AddCertificate(const CertInfo& cert) {
         return 0;
     }
 
+    std::string parsed_private_key;
+    const std::string* private_key_in_use = &cert.private_key;
+    if (!cert.private_key_passwd.empty()) {
+        if (!ParsePrivateKeyWithPassword(cert.private_key,
+                cert.private_key_passwd,
+                &parsed_private_key)) {
+            LOG(ERROR) << "Failed to parse private key with password";
+            return -1;
+        }
+        private_key_in_use = &parsed_private_key;
+    }
+
     SSLContext ssl_ctx;
     ssl_ctx.filters = cert.sni_filters;
     ssl_ctx.ctx = std::make_shared<SocketSSLContext>();
     SSL_CTX* raw_ctx = CreateServerSSLContext(
-        cert.certificate, cert.private_key,
+        cert.certificate, *private_key_in_use,
         _options.ssl_options(), &_raw_alpns, &ssl_ctx.filters);
     if (raw_ctx == NULL) {
         return -1;
@@ -2226,5 +2370,134 @@ int Server::SSLSwitchCTXByHostname(struct ssl_st* ssl,
     return SSL_TLSEXT_ERR_OK;
 }
 #endif // SSL_CTRL_SET_TLSEXT_HOSTNAME
+
+bool Server::StartSSLCertificateReloadThread() {
+    BAIDU_SCOPED_LOCK(_ssl_reload_cert_mutex);
+    if (_ssl_reload_cert_thread_started) {
+        return true;
+    }
+
+    _ssl_reload_cert_thread_should_stop = false;
+
+    bthread_attr_t attr = BTHREAD_ATTR_NORMAL;
+    if (bthread_start_background(&_ssl_reload_cert_thread, &attr,
+                                 Server::SSLCertificateReloadWorkerWrapper, this) != 0) {
+        _ssl_reload_cert_thread = INVALID_BTHREAD;
+        return false;
+    }
+
+    _ssl_reload_cert_thread_started = true;
+    LOG(INFO) << "Started SSL certificate reload worker thread";
+    return true;
+}
+
+void* Server::SSLCertificateReloadWorkerWrapper(void* arg) {
+    Server* server = static_cast<Server*>(arg);
+    return server->SSLCertificateReloadWorker(arg);
+}
+
+void* Server::SSLCertificateReloadWorker(void* arg) {
+    (void)arg;
+#if defined(__linux__)
+    pthread_setname_np(pthread_self(), "brpc_cert_monitor");
+#elif defined(__APPLE__)
+    pthread_setname_np("brpc_cert_monitor");
+#endif
+    if (!_options.has_ssl_options()) {
+        return nullptr;
+    }
+
+    const ServerSSLOptions& ssl_options = _options.ssl_options();
+    int interval_s = ssl_options.certificate_reload_interval_s;
+
+    const std::string& cert_path = ssl_options.default_cert.certificate;
+    const std::string& key_path = ssl_options.default_cert.private_key;
+    const std::string& ca_path = ssl_options.verify.ca_file_path;
+
+    const int64_t sleep_us = static_cast<int64_t>(interval_s) * 1000000L;
+
+    time_t last_cert_mtime = 0;
+    time_t last_key_mtime = 0;
+    time_t last_ca_mtime = 0;
+    bool cert_time_inited = false;
+    bool key_time_inited = false;
+    bool ca_time_inited = false;
+
+    while (true) {
+        {
+            BAIDU_SCOPED_LOCK(_ssl_reload_cert_mutex);
+            if (_ssl_reload_cert_thread_should_stop) {
+                break;
+            }
+        }
+
+        // the check_num is used to decide whether we need to reload certificates
+        // if ca change check_num |= 1 << 2
+        // if key change check_num |= 1 << 1
+        // if cert change check_num |= 1
+        // therefore when check_num is odd, we need to reload
+        int check_num = 0;
+
+        if (!ca_path.empty()) {
+            struct stat ca_stat;
+            if (stat(ca_path.c_str(), &ca_stat) == 0) {
+                if (!ca_time_inited) {
+                    last_ca_mtime = ca_stat.st_mtime;
+                    ca_time_inited = true;
+                } else if (ca_stat.st_mtime != last_ca_mtime) {
+                    last_ca_mtime = ca_stat.st_mtime;
+                    check_num |= 1 << 2;
+                }
+            } else {
+                PLOG_EVERY_N(WARNING, 60)
+                    << "Fail to stat ca file `" << ca_path << "'";
+            }
+        }
+
+        if (!key_path.empty()) {
+            struct stat key_stat;
+            if (stat(key_path.c_str(), &key_stat) == 0) {
+                if (!key_time_inited) {
+                    last_key_mtime = key_stat.st_mtime;
+                    key_time_inited = true;
+                } else if (key_stat.st_mtime != last_key_mtime) {
+                    last_key_mtime = key_stat.st_mtime;
+                    check_num |= 1 << 1;
+                }
+            } else {
+                PLOG_EVERY_N(WARNING, 60)
+                    << "Fail to stat private key file `" << key_path << "'";
+            }
+        }
+
+        if (!cert_path.empty()) {
+            struct stat cert_stat;
+            if (stat(cert_path.c_str(), &cert_stat) == 0) {
+                if (!cert_time_inited) {
+                    last_cert_mtime = cert_stat.st_mtime;
+                    cert_time_inited = true;
+                } else if (cert_stat.st_mtime != last_cert_mtime) {
+                    last_cert_mtime = cert_stat.st_mtime;
+                    check_num |= 1;
+                }
+            } else {
+                PLOG_EVERY_N(WARNING, 60)
+                    << "Fail to stat certificate file `" << cert_path << "'";
+            }
+        }
+
+        if ((check_num & 1) == 1) {
+            LOG(INFO) << "Detected certificate changed, reloading SSL context...";
+            ReloadCertificate();
+        }
+
+        if (bthread_usleep(sleep_us) != 0 && errno == ESTOP) {
+            break;
+        }
+    }
+
+    LOG(INFO) << "SSL certificate reload worker thread exiting";
+    return NULL;
+}
 
 }  // namespace brpc

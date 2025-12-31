@@ -449,6 +449,12 @@ public:
     // NOTE: clearing services when server is running is forbidden.
     void ClearServices();
 
+    // Reload the default SSL certificate without restarting the server.
+    // This method creates a new SSL context with the updated certificate
+    // and safely replaces the old one with delayed cleanup.
+    // Can be called while the server is running, but it's not thread-safe by itself.
+    void ReloadCertificate();
+
     // Dynamically add a new certificate into server. It can be called
     // while the server is running, but it's not thread-safe by itself.
     // Returns 0 on success, -1 otherwise.
@@ -636,6 +642,10 @@ friend class Controller;
     static bool ResetCertMappings(CertMaps& bg, const SSLContextMap& ctx_map);
     static bool ClearCertMapping(CertMaps& bg);
 
+    bool StartSSLCertificateReloadThread();
+    void* SSLCertificateReloadWorker(void* arg);
+    static void* SSLCertificateReloadWorkerWrapper(void* arg);
+
     AdaptiveMaxConcurrency& MaxConcurrencyOf(MethodProperty*);
     int MaxConcurrencyOf(const MethodProperty*) const;
 
@@ -696,6 +706,14 @@ friend class Controller;
     mutable bvar::Adder<int64_t> _nerror_bvar;
     mutable bvar::PerSecond<bvar::Adder<int64_t> > _eps_bvar;
     BAIDU_CACHELINE_ALIGNMENT mutable int32_t _concurrency;
+
+    // SSL context cleanup members
+    butil::Mutex _ssl_cleanup_mutex;
+    butil::Mutex _default_ssl_ctx_mutex;
+    butil::Mutex _ssl_reload_cert_mutex;
+    bthread_t _ssl_reload_cert_thread;
+    bool _ssl_reload_cert_thread_started;
+    bool _ssl_reload_cert_thread_should_stop;
 };
 
 // Get the data attached to current searching thread. The data is created by

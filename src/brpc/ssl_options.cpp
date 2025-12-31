@@ -34,6 +34,8 @@ ServerSSLOptions::ServerSSLOptions()
     , session_lifetime_s(300)
     , session_cache_size(20480)
     , ecdhe_curve_name("prime256v1")
+    , enable_certificate_reload(false)
+    , certificate_reload_interval_s(3600)
 {}
 
 } // namespace brpc

@@ -102,6 +102,14 @@ SSLState DetectSSLState(int fd, int* error_code);
 void Print(std::ostream& os, SSL* ssl, const char* sep);
 void Print(std::ostream& os, X509* cert, const char* sep);
 
+bool IsPemFormattedKey(const std::string& input);
+
+int PasswordCallback(char *buf, int size, int rwflag, void *userdata);
+
+bool ParsePrivateKeyWithPassword(const std::string& source,
+                                        const std::string& password,
+                                        std::string* parsed_key);
+
 } // namespace brpc
 
 #endif // BRPC_SSL_HELPER_H
